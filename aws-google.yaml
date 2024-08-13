@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Basic infrastructure for React/Django app
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-xxxxxxxx  # Replace with your AMI
+      InstanceType: t2.micro  # Replace with desired instance type
+      KeyName: my-key-pair  # Replace with your key pair name
+      SecurityGroups:
+        - Ref: SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          # Install required packages (e.g., Python, Node.js, Nginx)
+          # Clone your repository
+          # Configure Django and React
+          # Start services
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for EC2 instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0

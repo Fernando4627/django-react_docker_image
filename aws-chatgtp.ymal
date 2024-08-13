@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Scalable AWS CloudFormation template to deploy a web server with React frontend and Django backend, including HTTPS support.
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues: 
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: Must be a valid EC2 instance type.
+  
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+  
+  DBUsername:
+    Description: The database admin account username
+    Type: String
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters.
+
+  DBPassword:
+    Description: The database admin account password
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: Must contain only alphanumeric characters.
+
+  DomainName:
+    Description: The domain name for the application
+    Type: String
+
+  CertificateArn:
+    Description: The ARN of the SSL certificate from ACM
+    Type: String
+
+Resources:
+  # Security Group
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Enable SSH, HTTP, and HTTPS access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0  # Django Development Server
+
+  # Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "WebServerLoadBalancer"
+      Subnets: 
+        - subnet-xxxxxxx1  # Replace with actual Subnet IDs
+        - subnet-xxxxxxx2
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      Scheme: internet-facing
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      SslPolicy: ELBSecurityPolicy-2016-08
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: "WebServerTargetGroup"
+      VpcId: vpc-xxxxxxx  # Replace with your VPC ID
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+
+  # Auto Scaling Group
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: 
+        - subnet-xxxxxxx1  # Replace with actual Subnet IDs
+        - subnet-xxxxxxx2
+      LaunchConfigurationName: !Ref WebServerLaunchConfiguration
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+
+  WebServerLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      ImageId: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e  # Exit on any error
+
+          # Update and install necessary packages
+          yum update -y
+          yum install -y git httpd python3-pip
+          amazon-linux-extras install -y nginx1 nodejs14
+
+          # Install and configure Django backend
+          pip3 install virtualenv
+          mkdir /var/www/backend
+          cd /var/www/backend
+          virtualenv venv
+          source venv/bin/activate
+          pip install django djangorestframework gunicorn psycopg2-binary
+          django-admin startproject backend .
+          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" backend/settings.py
+          python manage.py migrate
+          python manage.py collectstatic --noinput
+          python manage.py createsuperuser --noinput --username admin --email admin@example.com
+
+          # Test Django server
+          echo "Testing Django server..."
+          python manage.py check
+          python manage.py test
+          echo "Django tests passed!"
+
+          # Configure gunicorn
+          cat > /etc/systemd/system/gunicorn.service << EOL
+          [Unit]
+          Description=gunicorn daemon
+          After=network.target
+
+          [Service]
+          User=ec2-user
+          Group=nginx
+          WorkingDirectory=/var/www/backend
+          ExecStart=/var/www/backend/venv/bin/gunicorn --workers 3 --bind 0.0.0.0:8000 backend.wsgi:application
+
+          [Install]
+          WantedBy=multi-user.target
+          EOL
+
+          systemctl start gunicorn
+          systemctl enable gunicorn
+
+          # Test Gunicorn service
+          echo "Testing Gunicorn service..."
+          systemctl status gunicorn || exit 1
+          echo "Gunicorn service is running!"
+
+          # Install and build React frontend
+          mkdir /var/www/frontend
+          cd /var/www/frontend
+          npx create-react-app frontend
+          cd frontend
+          npm run build
+          
+          # Sync static files to S3
+          aws s3 sync build/ s3://my-react-app-bucket/  # Replace with your S3 bucket
+          if [ $? -eq 0 ]; then
+            echo "S3 sync successful!"
+          else
+            echo "S3 sync failed!" >&2
+            exit 1
+          fi
+
+          # Configure Nginx for React frontend and proxy to Django backend
+          cat > /etc/nginx/nginx.conf << EOL
+          user nginx;
+          worker_processes auto;
+          error_log /var/log/nginx/error.log;
+          pid /var/run/nginx.pid;
+
+          events {
+              worker_connections 1024;
+          }
+
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              sendfile on;
+              keepalive_timeout 65;
+
+              server {
+                  listen 80;
+                  server_name _;
+
+                  location / {
+                      proxy_pass https://dxxxxx.cloudfront.net;  # Replace with your CloudFront distribution
+                  }
+
+                  location /api/ {
+                      proxy_pass http://127.0.0.1:8000;
+                      proxy_set_header Host \$host;
+                      proxy_set_header X-Real-IP \$remote_addr;
+                      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto \$scheme;
+                  }
+              }
+          }
+          EOL
+
+          systemctl restart nginx
+
+          # Test Nginx service
+          echo "Testing Nginx service..."
+          systemctl status nginx || exit 1
+          echo "Nginx service is running!"
+
+  # RDS MySQL Database
+  MySQLDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: mydb
+      AllocatedStorage: 20
+      DBInstanceClass: db.t2.micro
+      Engine: MySQL
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !GetAtt WebServerSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: true
+
+  # S3 Bucket for React Frontend
+  ReactAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-react-app-bucket  # Replace with your desired bucket name
+      AccessControl: PublicRead
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt ReactAppBucket.DomainName
+            Id: S3-React-App
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: S3-React-App
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: 
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+        DefaultRootObject: index.html
+
+Outputs:
+  WebsiteURL:
+    Description: The CloudFront URL for the React frontend
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  LoadBalancerDNSName:
+    Description: The DNS name of the load balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
